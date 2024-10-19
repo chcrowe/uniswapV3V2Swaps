@@ -39,6 +39,9 @@ const ROYAL_BLUE = "\x1b[34m";
 const ORANGE = "\x1b[38;5;214m"; 
 const RESET = "\x1b[0m";
 
+let lastV2Ratio = null;
+let lastV3Ratio = null;
+
 // Define a class for Tokens
 class Token {
   constructor(address, symbol, decimals, reserves = 0) {
@@ -173,10 +176,10 @@ async function getTokenInfo(tokenAddress) {
   const [decimals, symbol] = await Promise.all([tokenContract.decimals(), tokenContract.symbol()]);
   return { decimals, symbol };
 }
-const columnWidths = [10, 12, 10, 20, 20, 25];
+const columnWidths = [10, 12, 10, 20, 20, 25, 10];
 
 // Helper function to format the printed row
-function formatSwapRow(date, poolId, swapType, token0Amount, token1Amount, ratio) {
+function formatSwapRow(date, poolId, swapType, token0Amount, token1Amount, ratio, priceDifference) {
 
   const row = [
     padString(`${date.format("HH:mm:ss")}`, columnWidths[0]),
@@ -185,6 +188,7 @@ function formatSwapRow(date, poolId, swapType, token0Amount, token1Amount, ratio
     padString(token0Amount.toFixed(6), columnWidths[3], "right"),
     padString(token1Amount.toFixed(6), columnWidths[4], "right"),
     padString("  " + ratio, columnWidths[5]),
+    padString(priceDifference, columnWidths[6], "right")
   ];
 
   console.log(row.join(""));
@@ -231,28 +235,40 @@ async function calculateV3Price(_pool, _token0, _token1) {
   return adjustedPrice.toString();
 }
 
+// Compare the ratios and calculate percentage difference for arbitrage opportunity
+function calculateArbitrageOpportunity(v2Ratio, v3Ratio) {
+  const priceDifference = (((v3Ratio - v2Ratio) / v2Ratio) * 100).toFixed(2);
 
-const checkPrice = async (v3Pool, v2Pair, _token0, _token1) => {
-  isExecuting = true
+  // Define a threshold for arbitrage opportunity (e.g., 1%)
+  const arbitrageThreshold = 1; // You can adjust this
 
-  const currentBlock = await v2Provider.getBlockNumber()
-  // or v3Provider
+  console.log(`V2 Ratio: ${v2Ratio}, V3 Ratio: ${v3Ratio} ... Price Difference: ${priceDifference}%`);
 
-  const v3Price = await calculateV3Price(v3Pool, _token0, _token1)
-  const v2Price = await calculateV2Price(v2Pair, _token0, _token1)
-
-  const v3FixedPrice = Number(v3Price).toFixed(UNITS)
-  const v2FixedPrice = Number(v2Price).toFixed(UNITS)
-  const priceDifference = (((v3FixedPrice - v2FixedPrice) / v2FixedPrice) * 100).toFixed(2)
-
-  console.log(`Current Block: ${currentBlock}`)
-  console.log(`-----------------------------------------`)
-  console.log(`V3 | ${_token1.symbol}/${_token0.symbol}\t | ${v3FixedPrice}`)
-  console.log(`V2 | ${_token1.symbol}/${_token0.symbol}\t | ${v2FixedPrice}\n`)
-  console.log(`Percentage Difference: ${priceDifference}%\n`)
-
-  return priceDifference
+  if (Math.abs(priceDifference) > arbitrageThreshold) {
+    console.log(`${GREEN}Arbitrage Opportunity Detected!${RESET}`);
+    // You can implement your arbitrage logic here, like making a trade
+  } else {
+    console.log(`${RED}No significant arbitrage opportunity.${RESET}`);
+  }
 }
+
+// Function to calculate the percentage difference between lastV3Ratio and lastV2Ratio
+function calcDifference() {
+  // Check if both ratios are available
+  if (lastV3Ratio && lastV2Ratio) {
+    const v2Ratio = parseFloat(lastV2Ratio);
+    const v3Ratio = parseFloat(lastV3Ratio);
+
+    // Calculate the percentage difference
+    const difference = (((v3Ratio - v2Ratio) / v2Ratio) * 100).toFixed(2);
+
+    // Return the difference
+    return `${difference}%`;
+  } else {
+    return "N/A";
+  }
+}
+
 
 // Subscribe to V2 Swap events
 async function subscribeToV2Swaps() {
@@ -263,7 +279,13 @@ async function subscribeToV2Swaps() {
     let token0Amount = Number(ethers.formatUnits(amount0In > amount0Out ? amount0In - amount0Out : amount0Out - amount0In, v2PairInfo.token0.decimals));
     let token1Amount = Number(ethers.formatUnits(amount1In > amount1Out ? amount1In - amount1Out : amount1Out - amount1In, v2PairInfo.token1.decimals));
 
-    let ratio = `1 ${v2PairInfo.token1.symbol} ≈ ${token0Amount / token1Amount} ${v2PairInfo.token0.symbol}`;
+    // Compute and store the ratio for V2
+    lastV2Ratio = (token0Amount / token1Amount).toFixed(7);
+
+    // Display the computed ratio
+    let ratio = `1 ${v2PairInfo.token1.symbol} ≈ ${lastV2Ratio} ${v2PairInfo.token0.symbol}`;
+
+    // let ratio = `1 ${v2PairInfo.token1.symbol} ≈ ${(token0Amount / token1Amount).toFixed(7)} ${v2PairInfo.token0.symbol}`;
 
     // Determine the swap type and apply color coding
     let swapType;
@@ -273,7 +295,8 @@ async function subscribeToV2Swaps() {
       swapType = PRIMARY_TOKEN_SYMBOL === v2PairInfo.token1.symbol ? `${RED}${v2PairInfo.token1.symbol}->${v2PairInfo.token0.symbol}${RESET}` : `${GREEN}${v2PairInfo.token1.symbol}->${v2PairInfo.token0.symbol}${RESET}`;
     }
 
-    formatSwapRow(date, `${ROYAL_BLUE}Uniswap V2${RESET}`, swapType, token0Amount, token1Amount, ratio);
+    let diff = calcDifference();
+    formatSwapRow(date, `${ROYAL_BLUE}Uniswap V2${RESET}`, swapType, token0Amount, token1Amount, ratio, diff);
   });
 }
 
@@ -283,20 +306,42 @@ async function subscribeToV3Swaps() {
     const block = await event.getBlock();
     const date = moment(block.timestamp * 1000);
 
+    // Calculate the absolute token amounts
     let token0Amount = Math.abs(Number(ethers.formatUnits(amount0, v3PoolInfo.token0.decimals)));
     let token1Amount = Math.abs(Number(ethers.formatUnits(amount1, v3PoolInfo.token1.decimals)));
 
-    let ratio = `1 ${v3PoolInfo.token1.symbol} ≈ ${token0Amount / token1Amount} ${v3PoolInfo.token0.symbol}`;
+    // Safely calculate the swap ratio, handle division by zero
+
+    // Compute and store the ratio for V3
+    lastV3Ratio = (token0Amount / token1Amount).toFixed(7);
+
+    // Display the computed ratio
+    let ratio = "";
+    if (token1Amount > 0) {
+      ratio = `1 ${v3PoolInfo.token1.symbol} ≈ ${lastV3Ratio} ${v3PoolInfo.token0.symbol}`;
+    } else {
+      ratio = "N/A"; // Handle gracefully if token1Amount is zero
+    }
 
     // Determine the swap type and apply color coding
     let swapType;
     if (amount0 > 0 && amount1 < 0) {
-      swapType = PRIMARY_TOKEN_SYMBOL === v3PoolInfo.token0.symbol ? `${RED}${v3PoolInfo.token0.symbol}->${v3PoolInfo.token1.symbol}${RESET}` : `${GREEN}${v3PoolInfo.token0.symbol}->${v3PoolInfo.token1.symbol}${RESET}`;
+      // token0 -> token1
+      swapType = PRIMARY_TOKEN_SYMBOL === v3PoolInfo.token0.symbol
+        ? `${RED}${v3PoolInfo.token0.symbol}->${v3PoolInfo.token1.symbol}${RESET}`
+        : `${GREEN}${v3PoolInfo.token0.symbol}->${v3PoolInfo.token1.symbol}${RESET}`;
+    } else if (amount0 < 0 && amount1 > 0) {
+      // token1 -> token0
+      swapType = PRIMARY_TOKEN_SYMBOL === v3PoolInfo.token1.symbol
+        ? `${RED}${v3PoolInfo.token1.symbol}->${v3PoolInfo.token0.symbol}${RESET}`
+        : `${GREEN}${v3PoolInfo.token1.symbol}->${v3PoolInfo.token0.symbol}${RESET}`;
     } else {
-      swapType = PRIMARY_TOKEN_SYMBOL === v3PoolInfo.token1.symbol ? `${RED}${v3PoolInfo.token1.symbol}->${v3PoolInfo.token0.symbol}${RESET}` : `${GREEN}${v3PoolInfo.token1.symbol}->${v3PoolInfo.token0.symbol}${RESET}`;
+      swapType = "Unknown"; // Handle edge cases if swap amounts are unclear
     }
 
-    formatSwapRow(date, `${ORANGE}Uniswap V3${RESET}`, swapType, token0Amount, token1Amount, ratio);
+    let diff = calcDifference();
+    // Print the swap information
+    formatSwapRow(date, `${ORANGE}Uniswap V3${RESET}`, swapType, token0Amount, token1Amount, ratio, diff);
   });
 }
 
@@ -321,7 +366,7 @@ async function startMonitoring() {
   const symbol0 = padString(v2Pair.token0.symbol, 10, "right");
   const symbol1 = padString(v2Pair.token1.symbol, 10, "right");
 
-  console.log(`TIME      POOL ID     TYPE               ${symbol0}          ${symbol1}  RATIO`)
+  console.log(`TIME      POOL ID     TYPE               ${symbol0}          ${symbol1}  RATIO               DIFFERENCE`)
 
 }
 
